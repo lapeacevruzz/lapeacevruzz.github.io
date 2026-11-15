@@ -1,0 +1,464 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>VR Chess</title>
+<style>
+:root{--bg:#0d1226;--fg:#e8ecff;--ac:#4f8cff;--card:rgba(14,18,40,.85);box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){color-scheme:dark}}
+html,body{margin:0;height:100%;background:var(--bg);color:var(--fg);font-family:system-ui,sans-serif;overflow:hidden}
+canvas{display:block}
+#ui{position:fixed;left:12px;top:calc(12px + env(safe-area-inset-top,0px));max-width:320px;background:var(--card);padding:14px;border-radius:14px}
+#ui h1{margin:0 0 6px;font-size:20px}#ui p{margin:6px 0;font-size:13px;line-height:1.4}
+#vr{background:var(--ac);color:#fff;border:0;border-radius:10px;padding:12px 18px;font-size:16px;cursor:pointer;width:100%}
+#vr:disabled{opacity:.5}
+#dbg button{margin:3px 2px;padding:8px 12px;border:0;border-radius:8px;background:#26305f;color:#fff;font-size:13px;cursor:pointer}#dbg button:hover{background:var(--ac)}
+</style></head><body>
+<div id="ui"><h1>♞ VR Chess</h1><button id="vr" disabled>Checking VR…</button>
+<p>In VR: aim at a piece and hold the <b>trigger</b> to pick it up, move it over a square and release to place it. Press <b>Y</b> (or <b>X</b>) on the left controller for the settings menu.</p>
+<p>On desktop: click to play, <b>M</b> opens the menu.</p>
+<p><b>4 Player Chess:</b> menu ▸ Crazy Chess ▸ turn it ON, then <b>New Game</b>.</p><p><b>Online (screen mode):</b></p><div id="dbg"></div></div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-auth-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-database-compat.js"></script>
+<script>
+/* >>> PASTE YOUR FIREBASE WEB CONFIG HERE (Firebase console > Project settings > Your apps > Web app) <<< */
+const FIREBASE_CONFIG={apiKey:'AIzaSyC-5EAkMMLiGtv6laojudTEAodmIxu1sLo',authDomain:'vrchess.firebaseapp.com',databaseURL:'https://vrchess-default-rtdb.firebaseio.com',projectId:'vrchess',storageBucket:'vrchess.firebasestorage.app',messagingSenderId:'937203961666',appId:'1:937203961666:web:4a7e4dda7112557b7582db'};
+/* ---------- chess engine (signed pieces: 1P 2N 3B 4R 5Q 6K, +white -black; idx=rank*8+file) ---------- */
+const N=[[1,2],[2,1],[-1,2],[-2,1],[1,-2],[2,-1],[-1,-2],[-2,-1]],D=[[1,0],[-1,0],[0,1],[0,-1],[1,1],[1,-1],[-1,1],[-1,-1]];
+function atk(b,sq,by){const r=sq>>3,f=sq&7,pr=r-by;
+ if(pr>=0&&pr<8)for(const df of[-1,1]){const ff=f+df;if(ff>=0&&ff<8&&b[pr*8+ff]===by)return true}
+ for(const[dr,df]of N){const rr=r+dr,ff=f+df;if(rr>=0&&rr<8&&ff>=0&&ff<8&&b[rr*8+ff]===2*by)return true}
+ for(let i=0;i<8;i++){let rr=r+D[i][0],ff=f+D[i][1],first=true;while(rr>=0&&rr<8&&ff>=0&&ff<8){const v=b[rr*8+ff]*by;if(v){if(v===5||(i<4?v===4:v===3)||(first&&v===6))return true;break}first=false;rr+=D[i][0];ff+=D[i][1]}}
+ return false}
+function gen(s){const{b,t,c,ep}=s,o=[];
+ for(let i=0;i<64;i++){const p=b[i]*t;if(p<=0)continue;const r=i>>3,f=i&7;
+  if(p===1){const rr=r+t,pr=rr===(t>0?7:0)?5:0,push=(to,x)=>o.push({f:i,t:to,pr,...x});
+   if(rr>=0&&rr<8){if(!b[rr*8+f]){push(rr*8+f);if(r===(t>0?1:6)&&!b[(r+2*t)*8+f])o.push({f:i,t:(r+2*t)*8+f,pr:0})}
+    for(const df of[-1,1]){const ff=f+df;if(ff<0||ff>7)continue;const to=rr*8+ff;if(b[to]*t<0)push(to);else if(to===ep)o.push({f:i,t:to,pr:0,ep:1})}}
+  }else{const A=p===2?N:D,lo=p===3?4:0,hi=p===4?4:8,sl=p>=3&&p<=5;
+   for(let k=lo;k<hi;k++){let rr=r+A[k][0],ff=f+A[k][1];while(rr>=0&&rr<8&&ff>=0&&ff<8){const to=rr*8+ff,q=b[to]*t;if(q<=0)o.push({f:i,t:to,pr:0});if(q||!sl)break;rr+=A[k][0];ff+=A[k][1]}}
+   const h=t>0?4:60,k=t>0?0:2;
+   if(p===6&&i===h){
+    if(c[k]&&!b[h+1]&&!b[h+2]&&b[h+3]===4*t&&!atk(b,h,-t)&&!atk(b,h+1,-t)&&!atk(b,h+2,-t))o.push({f:h,t:h+2,pr:0,cs:1});
+    if(c[k+1]&&!b[h-1]&&!b[h-2]&&!b[h-3]&&b[h-4]===4*t&&!atk(b,h,-t)&&!atk(b,h-1,-t)&&!atk(b,h-2,-t))o.push({f:h,t:h-2,pr:0,cs:-1})}}}
+ return o}
+function app(s,m){const b=s.b.slice(),t=s.t,c=s.c.slice(),p=b[m.f];let ep=-1;
+ b[m.t]=m.pr?m.pr*t:p;b[m.f]=0;if(m.ep)b[m.t-8*t]=0;
+ if(m.cs){if(m.cs>0){b[m.f+1]=4*t;b[m.f+3]=0}else{b[m.f-1]=4*t;b[m.f-4]=0}}
+ if(Math.abs(p)===1&&Math.abs(m.t-m.f)===16)ep=(m.f+m.t)/2;
+ if(Math.abs(p)===6){if(t>0)c[0]=c[1]=0;else c[2]=c[3]=0}
+ for(const q of[m.f,m.t]){if(q===7)c[0]=0;if(q===0)c[1]=0;if(q===63)c[2]=0;if(q===56)c[3]=0}
+ return{b,t:-t,c,ep}}
+const legal=s=>gen(s).filter(m=>{const n=app(s,m);return!atk(n.b,n.b.indexOf(6*s.t),-s.t)});
+const inChk=s=>atk(s.b,s.b.indexOf(6*s.t),-s.t);
+function init(){const b=new Int8Array(64),k=[4,2,3,5,6,3,2,4];for(let f=0;f<8;f++){b[f]=k[f];b[8+f]=1;b[48+f]=-1;b[56+f]=-k[f]}return{b,t:1,c:[1,1,1,1],ep:-1}}
+const V=[0,100,320,330,500,900,0];
+function ev(s){let x=0;for(let i=0;i<64;i++){const p=s.b[i];if(!p)continue;const a=Math.abs(p),r=i>>3,f=i&7;let v=V[a]+(a<5?(6-Math.abs(r-3.5)-Math.abs(f-3.5))*3:0);if(a===1)v+=(p>0?r:7-r)*6;x+=p>0?v:-v}return x*s.t}
+const sc=(s,m)=>Math.abs(s.b[m.t])*10-Math.abs(s.b[m.f])+(m.pr?50:0);
+function nm(s,d,a,b){if(d===0)return ev(s);const ms=legal(s);if(!ms.length)return inChk(s)?-99999-d:0;ms.sort((x,y)=>sc(s,y)-sc(s,x));
+ for(const m of ms){const v=-nm(app(s,m),d-1,-b,-a);if(v>a){a=v;if(a>=b)break}}return a}
+function best(s,d,noise){let bm=null,bv=-1e9;for(const m of legal(s)){const v=-nm(app(s,m),d-1,-1e9,1e9)+Math.random()*noise;if(v>bv){bv=v;bm=m}}return bm}
+
+/* ---------- 4-player engine (piece = owner*8+type; owner 0 Red,1 Blue,2 Yellow,3 Green,4 dead/grey; -1 = off-board; idx=row*14+col, row 0 = Red's back rank) ---------- */
+const FD=[[1,0],[0,1],[-1,0],[0,-1]],P4N=['Red','Blue','Yellow','Green'],C4=[0xbf3b43,0x4185bf,0xc09526,0x4e9161],DEAD=0x8a8a94,V4=[0,100,300,330,500,900,6000];
+const ok4=(r,c)=>r>=0&&r<14&&c>=0&&c<14&&((r>2&&r<11)||(c>2&&c<11));
+function init4(){const b=new Int16Array(196).fill(-1),kp=[-1,-1,-1,-1],K=[4,2,3,5,6,3,2,4];
+ for(let r=0;r<14;r++)for(let c=0;c<14;c++)if(ok4(r,c))b[r*14+c]=0;
+ for(let i=0;i<8;i++){const k=K[i];
+  b[3+i]=k;b[17+i]=1;                                   /* Red: bottom */
+  b[(3+i)*14]=8+k;b[(3+i)*14+1]=9;                      /* Blue: left */
+  b[13*14+10-i]=16+k;b[12*14+10-i]=17;                  /* Yellow: top */
+  b[(10-i)*14+13]=24+k;b[(10-i)*14+12]=25}              /* Green: right */
+ b.forEach((p,i)=>{if(p>0&&(p&7)===6)kp[p>>3]=i});
+ return{b,t:0,al:[1,1,1,1],kp}}
+const nxs=(s,o)=>{for(let k=1;k<=4;k++){const n=(o+k)%4;if(s.al[n]&&s.kp[n]>=0)return n}return o};
+function gen4(s,o){const b=s.b,out=[];
+ for(let i=0;i<196;i++){const p=b[i];if(p<=0||(p>>3)!==o)continue;const t=p&7,r=(i/14)|0,c=i%14;
+  if(t===1){const[fr,fc]=FD[o],pr=fc?1:0,pc=fr?1:0,r1=r+fr,c1=c+fc,pm=(o===0?r1===10:o===2?r1===3:o===1?c1===10:c1===3)?5:0;
+   if(ok4(r1,c1)){const to=r1*14+c1;
+    if(b[to]===0){out.push({f:i,t:to,pr:pm});
+     if(o===0?r===1:o===2?r===12:o===1?c===1:c===12){const r2=r1+fr,c2=c1+fc;if(ok4(r2,c2)&&b[r2*14+c2]===0)out.push({f:i,t:r2*14+c2,pr:0})}}}
+   for(const sg of[-1,1]){const y=r1+sg*pr,x=c1+sg*pc;if(ok4(y,x)){const q=b[y*14+x];if(q>0&&(q>>3)!==o)out.push({f:i,t:y*14+x,pr:pm})}}
+  }else{const A=t===2?N:D,lo=t===3?4:0,hi=t===4?4:8,sl=t>=3&&t<=5;
+   for(let k=lo;k<hi;k++){let y=r+A[k][0],x=c+A[k][1];while(ok4(y,x)){const to=y*14+x,q=b[to];if(q===0||(q>0&&(q>>3)!==o))out.push({f:i,t:to,pr:0});if(q!==0||!sl)break;y+=A[k][0];x+=A[k][1]}}}}
+ return out}
+function do4(s,m){const b=s.b,p=b[m.f],o=p>>3,q=b[m.t];m.p=p;m.q=q;b[m.t]=m.pr?o*8+m.pr:p;b[m.f]=0;if((p&7)===6)s.kp[o]=m.t;if(q>0&&(q&7)===6&&(q>>3)<4)s.kp[q>>3]=-1}
+function un4(s,m){const b=s.b,p=m.p,q=m.q;b[m.f]=p;b[m.t]=q;if((p&7)===6)s.kp[p>>3]=m.f;if(q>0&&(q&7)===6&&(q>>3)<4)s.kp[q>>3]=m.t}
+/* is sq attacked by any live piece not owned by o? (dead/grey pieces never attack) */
+function atk4(s,sq,o){const b=s.b,r=(sq/14)|0,c=sq%14;
+ for(const[dr,dc]of N){const y=r+dr,x=c+dc;if(ok4(y,x)){const q=b[y*14+x];if(q>0&&(q&7)===2&&(q>>3)!==o&&(q>>3)<4)return true}}
+ for(let i=0;i<8;i++){let y=r+D[i][0],x=c+D[i][1],first=true;while(ok4(y,x)){const q=b[y*14+x];if(q!==0){const ow=q>>3,t=q&7;if(ow!==o&&ow<4&&(t===5||(i<4?t===4:t===3)||(first&&t===6)))return true;break}first=false;y+=D[i][0];x+=D[i][1]}}
+ for(let a=0;a<4;a++){if(a===o)continue;const[fr,fc]=FD[a],pr=fc?1:0,pc=fr?1:0;for(const sg of[-1,1]){const y=r-fr+sg*pr,x=c-fc+sg*pc;if(ok4(y,x)&&b[y*14+x]===a*8+1)return true}}
+ return false}
+function legal4(s,o){const out=[];for(const m of gen4(s,o)){do4(s,m);const k=s.kp[o],bad=k>=0&&atk4(s,k,o);un4(s,m);if(!bad)out.push(m)}return out}
+function ev4(s,me){if(s.kp[me]<0)return-50000;const b=s.b,m=[0,0,0,0];
+ for(let i=0;i<196;i++){const p=b[i];if(p<=0)continue;const o=p>>3;if(o>3)continue;const t=p&7;let v=V4[t];
+  if(t<6){const r=(i/14)|0,c=i%14;v+=t===1?(o===0?r-1:o===2?12-r:o===1?c-1:12-c)*8:(7-Math.max(Math.abs(r-6.5),Math.abs(c-6.5)))*5}
+  m[o]+=v}
+ let x=m[me],n=0;for(let o=0;o<4;o++)if(o!==me&&s.kp[o]>=0){x-=.4*m[o];n++}
+ return n?x:x+50000}
+const mo4=(s,m)=>V4[s.b[m.t]&7]*10-V4[s.b[m.f]&7]/10+(m.pr?500:0);
+let nd4=0;
+/* paranoid alpha-beta: bot maximises, everyone else is assumed to minimise */
+function sr4(s,d,a,b,me){if(d===0||nd4>80000)return ev4(s,me);nd4++;
+ const o=s.t,ms=gen4(s,o);if(!ms.length)return ev4(s,me);ms.sort((x,y)=>mo4(s,y)-mo4(s,x));
+ const mx=o===me;let bv=mx?-1e9:1e9;
+ for(const m of ms){do4(s,m);const ot=s.t;s.t=nxs(s,o);const v=sr4(s,d-1,a,b,me);s.t=ot;un4(s,m);
+  if(mx){if(v>bv)bv=v;if(bv>a)a=bv}else{if(v<bv)bv=v;if(bv<b)b=bv}if(a>=b)break}
+ return bv}
+function best4(s,o,lvl){const ms=legal4(s,o);if(!ms.length)return null;nd4=0;ms.sort((x,y)=>mo4(s,y)-mo4(s,x));
+ let bm=null,bv=-1e9;const ot=s.t;
+ for(const m of ms){do4(s,m);s.t=nxs(s,o);const v=sr4(s,DEP[lvl]-1,-1e9,1e9,o)+Math.random()*(NOI[lvl]+.5);s.t=ot;un4(s,m);if(v>bv){bv=v;bm=m}}
+ return bm}
+
+/* ---------- scene ---------- */
+const S=.07,H=.85,BZ=-.7,V3=THREE.Vector3;
+const renderer=new THREE.WebGLRenderer({antialias:true});renderer.setPixelRatio(Math.min(devicePixelRatio,2));renderer.setSize(innerWidth,innerHeight);renderer.xr.enabled=true;document.body.appendChild(renderer.domElement);
+const scene=new THREE.Scene();scene.background=new THREE.Color(0x0d1226);
+const camera=new THREE.PerspectiveCamera(60,innerWidth/innerHeight,.02,50);camera.position.set(0,1.55,.35);camera.lookAt(0,H,BZ);
+const hemi=new THREE.HemisphereLight(0xffffff,0x334466,.9);scene.add(hemi);const dl=new THREE.DirectionalLight(0xffffff,.8);dl.position.set(1,3,1);scene.add(dl);
+const M=(c,o={})=>new THREE.MeshStandardMaterial({color:c,roughness:.5,...o});
+const add=(p,geo,mt,x=0,y=0,z=0)=>{const m=new THREE.Mesh(geo,mt);m.position.set(x,y,z);p.add(m);return m};
+const fl=add(scene,new THREE.CircleGeometry(5,48),M(0x1a2040));fl.rotation.x=-Math.PI/2;const grid=new THREE.GridHelper(10,40,0x3a4a90,0x222a55);scene.add(grid);
+
+/* ---------- environments: groups shown/hidden by setEnv (Neon Grid = the original floor + grid) ---------- */
+const ENVN=['Neon Grid','Space','Park','Library','Beach'],envG=ENVN.map(()=>{const e=new THREE.Group();e.visible=false;scene.add(e);return e});
+/* [sky, fog[near,far]|null, hemi sky, hemi ground, hemi intensity, sun intensity] */
+const ENVS=[[0x0d1226,null,0xffffff,0x334466,.9,.8],[0x02030a,null,0x8899cc,0x000011,.7,.5],[0x87ceeb,[12,45],0xffffff,0x5a8a40,1.1,1],[0x24160e,null,0xffe0b0,0x3a2010,.6,.25],[0xff9a5c,[14,50],0xffd6a8,0x7a5a3a,.9,.7]];
+const flr=(e,c,r,y=0)=>{const f=add(e,new THREE.CircleGeometry(r,48),M(c,{roughness:.95}),0,y,0);f.rotation.x=-Math.PI/2;return f};
+const bm=(e,w,h,d,c,x,y,z)=>add(e,new THREE.BoxGeometry(w,h,d),M(c),x,y,z),bas=(c)=>new THREE.MeshBasicMaterial({color:c,fog:false});
+{/* Space */const e=envG[1],a=new Float32Array(2400);
+ for(let i=0;i<800;i++){const u=Math.random()*6.283,v=Math.acos(Math.random()*2-1),r=20+Math.random()*10;a.set([r*Math.sin(v)*Math.cos(u),1+r*Math.cos(v),r*Math.sin(v)*Math.sin(u)],i*3)}
+ const geo=new THREE.BufferGeometry();geo.setAttribute('position',new THREE.BufferAttribute(a,3));e.add(new THREE.Points(geo,new THREE.PointsMaterial({color:0xffffff,size:.12})));
+ flr(e,0x1b2248,2.2,-.01);const rim=add(e,new THREE.TorusGeometry(2.2,.03,6,64),new THREE.MeshBasicMaterial({color:0x4f8cff}));rim.rotation.x=Math.PI/2;
+ add(e,new THREE.SphereGeometry(3,32,20),M(0xc8683a,{emissive:0x401a08}),-9,5,-16);
+ const rg=add(e,new THREE.TorusGeometry(4.6,.25,2,48),M(0xe0b080,{emissive:0x302010}),-9,5,-16);rg.rotation.x=1.3;
+ add(e,new THREE.SphereGeometry(1,24,16),M(0x4a8fe0,{emissive:0x102040}),10,8,-12)}
+{/* Park */const e=envG[2];flr(e,0x4c9a3a,40);
+ for(let i=0;i<16;i++){const u=i*.39+Math.random()*.2,r=5+Math.random()*7,x=Math.cos(u)*r,z=Math.sin(u)*r,k=.8+Math.random()*.6;
+  add(e,new THREE.CylinderGeometry(.1*k,.14*k,1.2*k,8),M(0x6b4a2b),x,.6*k,z);add(e,new THREE.ConeGeometry(.8*k,2*k,10),M(0x2f7d32),x,2*k,z);add(e,new THREE.ConeGeometry(.6*k,1.4*k,10),M(0x3b9a3f),x,3*k,z)}
+ add(e,new THREE.SphereGeometry(2,20,14),bas(0xfff3a0),12,16,-28);
+ for(let i=0;i<6;i++){const c=add(e,new THREE.SphereGeometry(1,12,8),bas(0xffffff),-18+i*7,14+i%3*2,-26);c.scale.set(3,.8,1.3)}}
+{/* Library */const e=envG[3],W=0x5b3a29;
+ bm(e,6.9,.05,6.9,0x6b4226,0,-.03,0);flr(e,0x7a2e2e,1.5,.002);
+ bm(e,7,3.2,.1,W,0,1.6,-3.45);bm(e,7,3.2,.1,W,0,1.6,3.45);bm(e,.1,3.2,7,W,-3.45,1.6,0);bm(e,.1,3.2,7,W,3.45,1.6,0);bm(e,7,.1,7,0x3a2618,0,3.2,0);
+ const c=document.createElement('canvas');c.width=512;c.height=384;const x=c.getContext('2d');x.fillStyle='#2b1a10';x.fillRect(0,0,512,384);
+ for(let r=0;r<6;r++){let u=8;while(u<500){const w=10+Math.random()*16|0,h=40+Math.random()*16|0;x.fillStyle='hsl('+(Math.random()*360|0)+',45%,'+(28+Math.random()*20|0)+'%)';x.fillRect(u,r*64+60-h,w,h);u+=w+2}x.fillStyle='#4a2f1b';x.fillRect(0,r*64+60,512,5)}
+ const sm=new THREE.MeshStandardMaterial({map:new THREE.CanvasTexture(c),roughness:.8});
+ [[-1.7,-3.39,0],[1.7,-3.39,0],[-3.39,0,Math.PI/2],[3.39,0,-Math.PI/2]].forEach(([px,pz,ry])=>{const m=new THREE.Mesh(new THREE.PlaneGeometry(3.3,2.5),sm);m.position.set(px,1.5,pz);m.rotation.y=ry;e.add(m)});
+ add(e,new THREE.SphereGeometry(.12,12,8),new THREE.MeshBasicMaterial({color:0xffd9a0}),0,2.6,-.4);const L=new THREE.PointLight(0xffb86b,1.1,9);L.position.set(0,2.6,-.4);e.add(L)}
+{/* Beach */const e=envG[4];flr(e,0x2a7fa8,60,-.05);flr(e,0xe8d29a,3.2,-.02);
+ add(e,new THREE.SphereGeometry(4,24,16),bas(0xfff0b0),0,3,-38);
+ [[-2.6,-2.4],[2.8,-2.8],[-3,1.8],[3.1,1.2]].forEach(([x,z],i)=>{const t=add(e,new THREE.CylinderGeometry(.07,.11,2.6,8),M(0x8a6a44),x,1.3,z);t.rotation.z=i%2?.15:-.15;
+  for(let k=0;k<6;k++){const l=add(e,new THREE.ConeGeometry(.12,1.4,4),M(0x2e8b3d),x+(i%2?.2:-.2),2.6,z);l.geometry.translate(0,.7,0);l.rotation.set(0,k*1.047,1.2)}})}
+function setEnv(i){envG.forEach((e,k)=>e.visible=k===i);fl.visible=grid.visible=!i;const v=ENVS[i];scene.background.setHex(v[0]);scene.fog=v[1]?new THREE.Fog(v[0],v[1][0],v[1][1]):null;hemi.color.setHex(v[2]);hemi.groundColor.setHex(v[3]);hemi.intensity=v[4];dl.intensity=v[5]}
+add(scene,new THREE.BoxGeometry(1.3,.04,1),M(0x5a3a22),0,H-.05,BZ);
+add(scene,new THREE.CylinderGeometry(.09,.12,H-.07,20),M(0x3b2616),0,(H-.07)/2,BZ);
+const bg=new THREE.Group();bg.position.set(0,H,BZ);scene.add(bg);
+add(bg,new THREE.BoxGeometry(8.5*S,.02,8.5*S),M(0x3b2616),0,-.02,0);
+const sqPos=i=>new V3(((i&7)-3.5)*S,0,(3.5-(i>>3))*S);
+const tiles=[],hits=[],hl=[];
+const hlM=c=>new THREE.MeshBasicMaterial({color:c,transparent:true,opacity:.55,depthWrite:false});
+for(let i=0;i<64;i++){const p=sqPos(i);
+ tiles.push(add(bg,new THREE.BoxGeometry(S,.02,S),M(0xffffff),p.x,-.01,p.z));
+ const h=add(bg,new THREE.BoxGeometry(S,.14,S),new THREE.MeshBasicMaterial(),p.x,.07,p.z);h.visible=false;h.userData.sq=i;hits.push(h);
+ const d=add(bg,new THREE.CircleGeometry(S*.4,20),hlM(0x66ff88),p.x,.002,p.z);d.rotation.x=-Math.PI/2;d.visible=false;hl.push(d)}
+const hov=add(bg,new THREE.CircleGeometry(S*.46,20),hlM(0xffffff),0,.004,0);hov.rotation.x=-Math.PI/2;hov.material.opacity=.3;hov.visible=false;
+/* chess.com-style coordinates: file letters along rank 1, rank numbers down the a-file, tucked into square corners */
+const lbls=[];
+function coord(ch,sq,dx,dz){const c=document.createElement('canvas');c.width=c.height=64;const x=c.getContext('2d');x.fillStyle='#fff';x.font='bold 52px sans-serif';x.textAlign='center';x.textBaseline='middle';x.fillText(ch,32,34);
+ const m=new THREE.MeshBasicMaterial({map:new THREE.CanvasTexture(c),transparent:true,depthWrite:false}),p=sqPos(sq),l=add(bg,new THREE.PlaneGeometry(S*.34,S*.34),m,p.x+dx*S*.33,.001,p.z+dz*S*.33);l.rotation.x=-Math.PI/2;l.renderOrder=1;lbls.push({m,sq})}
+for(let i=0;i<8;i++){coord('abcdefgh'[i],i,1,1);coord(String(i+1),i*8,-1,-1)}
+const THEMES=[[0xeeeed2,0x769656],[0xe8c99b,0x8b5a2b],[0x3a4f9a,0x0f1536]];
+function setTheme(i){lbls.forEach(l=>{const lt=((l.sq>>3)+(l.sq&7))%2;l.m.color.setHex(i===2?0xcfe0ff:THEMES[i][lt?1:0])});tiles.forEach((t,k)=>{t.material.color.setHex(THEMES[i][((k>>3)+(k&7))%2?0:1]);t.material.emissive.setHex(i===2?(((k>>3)+(k&7))%2?0x0a1440:0x02041a):0)});
+ tiles4.forEach((t,k)=>{const o=(((k/14)|0)+k%14)%2;t.material.color.setHex(THEMES[i][o?0:1]);t.material.emissive.setHex(i===2?(o?0x0a1440:0x02041a):0)})}
+
+/* 4-player board: 14x14 cross, lives in its own group; shown only in 4-player games */
+const S4=.044,bg4=new THREE.Group();bg4.position.set(0,H,BZ);bg4.visible=false;scene.add(bg4);
+add(bg4,new THREE.BoxGeometry(14.5*S4,.02,8.5*S4),M(0x3b2616),0,-.02,0);add(bg4,new THREE.BoxGeometry(8.5*S4,.02,14.5*S4),M(0x3b2616),0,-.02,0);
+const sqPos4=i=>new V3(((i%14)-6.5)*S4,0,(6.5-((i/14)|0))*S4),tiles4=[],hits4=[],hl4=[];
+for(let i=0;i<196;i++){const r=(i/14)|0,c=i%14;if(!ok4(r,c))continue;const p=sqPos4(i);
+ tiles4[i]=add(bg4,new THREE.BoxGeometry(S4,.02,S4),M(0xffffff),p.x,-.01,p.z);
+ const h=add(bg4,new THREE.BoxGeometry(S4,.14,S4),new THREE.MeshBasicMaterial(),p.x,.07,p.z);h.visible=false;h.userData.sq=i;hits4.push(h);
+ const d=add(bg4,new THREE.CircleGeometry(S4*.4,20),hlM(0x66ff88),p.x,.002,p.z);d.rotation.x=-Math.PI/2;d.visible=false;hl4[i]=d}
+const hov4=add(bg4,new THREE.CircleGeometry(S4*.46,20),hlM(0xffffff),0,.004,0);hov4.rotation.x=-Math.PI/2;hov4.material.opacity=.3;hov4.visible=false;
+
+/* piece models */
+const P={1:[[0,0],[.3,0],[.3,.06],[.15,.2],[.1,.3],[.2,.34],[.12,.4],[0,.4]],2:[[0,0],[.32,0],[.32,.06],[.2,.16],[.16,.3],[0,.3]],
+3:[[0,0],[.32,0],[.32,.06],[.16,.2],[.14,.45],[.22,.5],[.12,.58],[0,.58]],4:[[0,0],[.34,0],[.34,.06],[.22,.16],[.2,.5],[.3,.55],[.3,.7],[.2,.7],[.2,.64],[0,.64]],
+5:[[0,0],[.34,0],[.34,.06],[.18,.22],[.16,.5],[.3,.62],[.3,.72],[.12,.74],[0,.74]],6:[[0,0],[.34,0],[.34,.06],[.2,.22],[.18,.55],[.3,.65],[.2,.75],[0,.75]]};
+function mk(t,col,hex){const g=new THREE.Group(),mt=M(hex!==undefined?hex:col>0?0xf1e6d0:0x2c2c36,{roughness:.35});
+ const sp=(r,y)=>add(g,new THREE.SphereGeometry(r*S,14,10),mt,0,y*S,0),bx=(w,h,d,x,y,z)=>add(g,new THREE.BoxGeometry(w*S,h*S,d*S),mt,x*S,y*S,z*S);
+ add(g,new THREE.LatheGeometry(P[t].map(p=>new THREE.Vector2(p[0]*S,p[1]*S)),18),mt);
+ if(t===1)sp(.17,.47);if(t===3)sp(.07,.66);if(t===5)sp(.1,.84);
+ if(t===6){bx(.08,.28,.08,0,.9,0);bx(.22,.08,.08,0,.92,0)}
+ if(t===2){bx(.18,.4,.2,0,.45,0);bx(.16,.2,.36,0,.66,-.12);bx(.06,.1,.05,0,.8,0);g.rotation.y=col>0?0:Math.PI}
+ g.userData={t,col};return g}
+
+/* little avatars: kind 0 player, 1..3 bots */
+function fig(col,k){const g=new THREE.Group();
+ add(g,new THREE.CylinderGeometry(.045,.06,.12,14),M(col),0,.09,0);
+ const hd=new THREE.Group();hd.position.y=.19;g.add(hd);
+ add(hd,k===2?new THREE.BoxGeometry(.1,.09,.09):new THREE.SphereGeometry(.05,16,12),M(k?0xdfe6f5:0xffd2a8),0,.04,0);
+ for(const s of[-1,1])add(hd,new THREE.SphereGeometry(.01,8,6),M(k?0x22ffdd:0x111111,{emissive:k?0x118877:0}),s*.02,.05,.046);
+ if(k===0)add(hd,new THREE.CylinderGeometry(.045,.052,.03,14),M(0x2a4fd0),0,.09,0);
+ if(k===1){add(hd,new THREE.CylinderGeometry(.004,.004,.06,6),M(0x888888),0,.11,0);add(hd,new THREE.SphereGeometry(.012,8,6),M(0xff4444,{emissive:0xaa0000}),0,.145,0)}
+ if(k===2)for(const s of[-1,1])add(hd,new THREE.BoxGeometry(.02,.04,.02),M(0xffb347),s*.055,.07,0);
+ if(k===3)add(hd,new THREE.CylinderGeometry(.05,.04,.04,5),M(0xffd24a,{metalness:.6}),0,.1,0);
+ for(const s of[-1,1]){const p=new THREE.Group();p.position.set(s*.065,.13,0);g.add(p);add(p,new THREE.CylinderGeometry(.012,.012,.08,8),M(col),0,-.04,0);g.userData[s<0?'aL':'aR']=p}
+ g.userData.hd=hd;return g}
+const BN=['Pawny','Knightro','Kingpin'],BC=[0x7bd88f,0xffb347,0xff6b6b],DEP=[1,2,3],NOI=[60,15,0];BN.push('Opponent');BC.push(0x9b8cff);
+const me=fig(0x4f8cff,0);me.position.set(.5,H-.03,-.45);me.scale.setScalar(1.2);me.lookAt(0,H-.03,BZ);scene.add(me);
+let bot=null;
+
+/* panels */
+const rr=(x,a,b,w,h,r)=>{x.beginPath();x.roundRect(a,b,w,h,r)};
+function panel(w,h,pw,ph){const c=document.createElement('canvas');c.width=w;c.height=h;const t=new THREE.CanvasTexture(c),m=new THREE.Mesh(new THREE.PlaneGeometry(pw,ph),new THREE.MeshBasicMaterial({map:t,transparent:true,side:THREE.DoubleSide}));m.userData={x:c.getContext('2d'),t};scene.add(m);return m}
+const clk=panel(512,256,.5,.25),menu=panel(512,680,.5,.664);
+clk.position.set(-.5,H+.2,BZ);clk.lookAt(0,H+.2,0);menu.visible=false;
+
+/* ---------- state ---------- */
+const TM=[0,1,3,5,10,15],IN=[0,1,2,3,5];
+const OPTS=[['Time',['Off','1 min','3 min','5 min','10 min','15 min'],'time'],['Increment',['0 s','1 s','2 s','3 s','5 s'],'inc'],['Opponent',BN.slice(0,3),'bot'],['Play as',['White','Black'],'side'],['Theme',['Classic','Walnut','Neon'],'theme'],['Environment',ENVN,'env']];
+const cfg={time:3,inc:0,bot:1,side:0,theme:0,env:0,cz:{}};const ON={role:null,peer:0,code:'',gr:null,opp:null,gid:'',seen:0};
+let g,pc=1,tm={1:0,'-1':0},pcs=[],mhov=null,lastKey='';
+const HR=[];OPTS.forEach(([l,v,k],i)=>{const y=116+i*66;HR.push({id:k+':-1',x:238,y:y-28,w:56,h:56,lab:'◀'},{id:k+':1',x:450,y:y-28,w:56,h:56,lab:'▶'})});
+HR.push({id:'online',x:260,y:484,w:228,h:60,lab:'🌐 Online ▸',c:'#0f7a8a'},{id:'new',x:24,y:560,w:228,h:80,lab:'New Game',c:'#1f8a4c'},{id:'res',x:260,y:560,w:228,h:80,lab:'Resume',c:'#26305f'},{id:'crazy',x:24,y:484,w:228,h:60,lab:'🌀 Crazy Chess ▸',c:'#6a2fb0'});
+/* CRAZY: add ['Rule label','key'] entries here later; each becomes an ON/OFF toggle in cfg.cz[key] */
+const CRAZY=[['4 Player Chess','four']],hr2=()=>[...CRAZY.map(([l,k],i)=>({id:'cz:'+k,x:24,y:120+i*70,w:464,h:56,lab:l+': '+(cfg.cz[k]?'ON':'OFF')})),{id:'back',x:24,y:560,w:464,h:80,lab:'◀ Back'}];let page=0;
+const hr3=()=>{if(ON.role==='guest')return[{id:'leave',x:24,y:560,w:464,h:80,lab:'Leave Game',c:'#a02a2a'}];
+ if(ON.role==='host')return[{id:'close',x:24,y:560,w:228,h:80,lab:'Close Server',c:'#a02a2a'},{id:'back',x:260,y:560,w:228,h:80,lab:'◀ Back'}];
+ if(page===4)return[...ONL.games().slice(0,5).map((q,i)=>({id:'j:'+q,x:24,y:130+i*70,w:464,h:60,lab:'Join game '+q,c:'#1f8a4c'})),{id:'back2',x:24,y:560,w:464,h:80,lab:'◀ Back'}];
+ return[{id:'create',x:24,y:150,w:464,h:90,lab:'Create Game',c:'#1f8a4c'},{id:'joinl',x:24,y:260,w:464,h:90,lab:'Join Game',c:'#0f7a8a'},{id:'back',x:24,y:560,w:464,h:80,lab:'◀ Back'}]};
+function drawOnline(){const x=menu.userData.x;x.clearRect(0,0,512,680);x.fillStyle='rgba(14,18,40,.95)';rr(x,0,0,512,680,28);x.fill();x.textAlign='center';x.fillStyle='#fff';x.font='bold 36px sans-serif';x.fillText('Online',256,64);
+ const T=(s,y,c,f)=>{x.font=f||'22px sans-serif';x.fillStyle=c||'#c9d3ff';x.fillText(s,256,y)};
+ if(!lobby){(fbMsg.match(/(.{1,34})(\s|$)/g)||[fbMsg]).forEach((l,i)=>T(l.trim(),130+i*28,'#ff9f6b','20px sans-serif'))}
+ else if(ON.role==='guest'){T('Joined game '+ON.code,150,'#7bd88f','bold 26px sans-serif');T(ON.peer?'You play '+(pc>0?'White':'Black'):'Waiting for the host…',204);T('Only the host can change settings',256,'#8893c8','18px sans-serif')}
+ else if(ON.role==='host'){T('Your game code',130);T(ON.code,206,'#ffd24a','bold 64px monospace');T(ON.peer?'Opponent connected':'Waiting for an opponent…',262,ON.peer?'#7bd88f':'#c9d3ff');T('◀ Back = settings, New Game restarts',320,'#8893c8','18px sans-serif')}
+ else if(page===4){const n=ONL.games().length;T(n?'Open games — tap to join':'No open games found',n?100:150)}
+ else T('Host a game or join one',130);
+ if(lobby&&fbMsg)T(fbMsg.slice(0,70),620,'#ff9f6b','15px sans-serif');
+ for(const h of hr3()){x.fillStyle=mhov===h.id?'#4f8cff':(h.c||'#26305f');rr(x,h.x,h.y,h.w,h.h,14);x.fill();x.fillStyle='#fff';x.font='26px sans-serif';x.textAlign='center';x.fillText(h.lab,h.x+h.w/2,h.y+h.h/2+10)}
+ menu.userData.t.needsUpdate=true}
+function drawMenu(){if(ON.role==='guest')page=3;if(page>=2)return drawOnline();const x=menu.userData.x;x.clearRect(0,0,512,680);x.fillStyle='rgba(14,18,40,.95)';rr(x,0,0,512,680,28);x.fill();
+ x.fillStyle='#fff';x.font='bold 36px sans-serif';x.textAlign='center';x.fillText(page?'Crazy Chess':'Match Settings',256,64);
+ if(page){x.font='24px sans-serif';x.fillStyle='#c9b3ff';x.fillText('More chaos coming soon…',256,120+CRAZY.length*70+(cfg.cz.four?70:20));
+  if(cfg.cz.four){x.font='18px sans-serif';x.fillText('You vs 3 bots · last king standing wins',256,206);x.fillText('Red ▸ Blue ▸ Yellow ▸ Green (clockwise)',256,232)}
+  for(const h of hr2()){x.fillStyle=mhov===h.id?'#4f8cff':'#26305f';rr(x,h.x,h.y,h.w,h.h,14);x.fill();x.fillStyle='#fff';x.font='26px sans-serif';x.textAlign='center';x.fillText(h.lab,h.x+h.w/2,h.y+h.h/2+10)}
+  x.font='17px sans-serif';x.fillStyle='#8893c8';x.fillText('Crazy rules apply on New Game',256,664);menu.userData.t.needsUpdate=true;return}
+ OPTS.forEach(([l,v,k],i)=>{const y=116+i*66;x.font='26px sans-serif';x.textAlign='left';x.fillStyle='#9fb4ff';x.fillText(l,24,y+9);x.textAlign='center';x.fillStyle='#fff';x.fillText((k==='side'&&cfg.cz.four?['Red','Yellow']:v)[cfg[k]],372,y+9)});
+ for(const h of HR){x.fillStyle=mhov===h.id?'#4f8cff':(h.c||'#26305f');rr(x,h.x,h.y,h.w,h.h,14);x.fill();x.fillStyle='#fff';x.font=(h.w>100?'bold 28px':'26px')+' sans-serif';x.textAlign='center';x.fillText((h.id==='crazy'&&Object.values(cfg.cz).some(Boolean))||(h.id==='online'&&ON.role)?h.lab+' ●':h.lab,h.x+h.w/2,h.y+h.h/2+10)}
+ x.font='17px sans-serif';x.fillStyle='#8893c8';x.fillText('Time, opponent & side apply on New Game',256,664);menu.userData.t.needsUpdate=true}
+function act(id){if(id==='online'){page=ON.role?3:2;return drawMenu()}
+ if(id==='create'){createGame();return}if(id==='joinl'){page=4;return drawMenu()}if(id==='back2'){page=2;return drawMenu()}
+ if(id.startsWith('j:')){joinGame(id.slice(2));return}
+ if(id==='leave'||id==='close'){leaveOnline(id==='close'?'Server closed':'You left the game');return}
+ if(id==='crazy'||id==='back'){page=id==='crazy'?1:0;return drawMenu()}if(id.startsWith('cz:')){const k=id.slice(3);cfg.cz[k]=!cfg.cz[k];return drawMenu()}if(id==='res')return toggleMenu(false);if(id==='new'){(ON.role==='host'&&ON.peer)?startOnline():newGame();return toggleMenu(false)}
+ const[k,d]=id.split(':'),o=OPTS.find(q=>q[2]===k);cfg[k]=(cfg[k]+ +d+o[1].length)%o[1].length;if(k==='theme')setTheme(cfg.theme);if(k==='env')setEnv(cfg.env);drawMenu()}
+function toggleMenu(on){on=on===undefined?!menu.visible:on;menu.visible=on;if(on){const xc=renderer.xr.isPresenting?renderer.xr.getCamera(camera):camera,p=new V3().setFromMatrixPosition(xc.matrixWorld),d=new V3();xc.getWorldDirection(d);d.y=0;d.normalize();
+ menu.position.copy(p).addScaledVector(d,.8);menu.position.y=p.y-.05;menu.lookAt(p.x,menu.position.y,p.z);drawMenu()}}
+const fmt=ms=>{ms=Math.max(0,ms);const s=Math.ceil(ms/1000);return Math.floor(s/60)+':'+String(s%60).padStart(2,'0')};
+function drawClock(){if(g.n4)return drawClock4();const timed=g.timed,key=[g.msg,g.rq&&g.rq[0],g.s.t,timed&&fmt(tm[1]),timed&&fmt(tm[-1]),pc,g.bot].join('|');if(key===lastKey)return;lastKey=key;
+ const x=clk.userData.x;x.clearRect(0,0,512,256);x.fillStyle='rgba(14,18,40,.92)';rr(x,0,0,512,256,22);x.fill();
+ [[-pc,BN[g.bot]+(g.online?'':' (bot)')],[pc,'You']].forEach(([side,name],i)=>{const y=14+i*80,on=!g.over&&g.s.t===side;x.fillStyle=on?'#2a4fd0':'#1b2250';rr(x,14,y,484,72,14);x.fill();
+  x.fillStyle=side>0?'#f1e6d0':'#555';x.beginPath();x.arc(46,y+36,14,0,7);x.fill();x.fillStyle='#fff';x.textAlign='left';x.font='26px sans-serif';x.fillText(name,74,y+45);
+  x.textAlign='right';x.font='bold 40px monospace';x.fillText(timed?fmt(tm[side]):'∞',484,y+49)});
+ x.textAlign='center';x.font='24px sans-serif';x.fillStyle='#ffd24a';x.fillText(g.msg,256,218);const q=g.rq;x.fillStyle=q?q[2]:'#8893c8';x.font=q?'bold 24px sans-serif':'16px sans-serif';x.fillText(q?q[1]+' '+q[0]:'Y / X on left controller = menu',256,244);clk.userData.t.needsUpdate=true}
+
+/* ---------- game flow ---------- */
+function place(){pcs.forEach(p=>p&&bg.remove(p));bg.children.filter(o=>o.userData.t).forEach(o=>bg.remove(o));pcs=new Array(64).fill(null);
+ for(let i=0;i<64;i++){const v=g.s.b[i];if(v){const m=mk(Math.abs(v),Math.sign(v));m.position.copy(sqPos(i));bg.add(m);pcs[i]=m}}}
+function newGame(){if(cfg.cz.four&&!ON.peer)return newGame4();bg4.visible=false;bg.visible=true;((g&&g.av)||[]).forEach(a=>scene.remove(a));clk.position.set(-.5,H+.2,BZ);clk.lookAt(0,H+.2,0);pc=cfg.side?-1:1;bg.rotation.y=pc>0?0:Math.PI;
+ g={s:init(),over:0,started:0,sel:-1,lm:[],last:null,winner:0,busy:0,bot:cfg.bot,timed:!!TM[cfg.time],inc:IN[cfg.inc]*1000,msg:''};
+ tm[1]=tm[-1]=TM[cfg.time]*60000;place();refresh();
+ if(bot)scene.remove(bot);bot=fig(BC[g.bot],g.bot+1);bot.position.set(0,H-.03,-1.1);bot.scale.setScalar(1.5);scene.add(bot);
+ badge.visible=false;msgUpd();lastKey='';if(g.s.t!==pc)botMove()}
+function msgUpd(){if(g.over)return;const mine=g.s.t===pc;g.msg=(inChk(g.s)?'Check! ':'')+(mine?'Your move':BN[g.bot]+' is thinking…')}
+function refresh(){hl.forEach(d=>d.visible=false);const on=(i,c,o)=>{hl[i].visible=true;hl[i].material.color.setHex(c);hl[i].material.opacity=o};
+ if(g.last)g.last.forEach(i=>on(i,0xffdd55,.35));g.lm.forEach(m=>{on(m.t,m.ep?0xff9f43:0x66ff88,.6);if(m.ep)on(m.t-8*g.s.t,0xff5555,.5)});if(g.sel>=0)on(g.sel,0x44aaff,.65)}
+function clickSq(sq){if(g.over||g.busy||g.s.t!==pc)return;const p=g.s.b[sq];
+ if(p*pc>0){g.sel=sq;g.lm=legal(g.s).filter(m=>m.f===sq)}
+ else{const m=g.sel>=0&&g.lm.find(m=>m.t===sq);if(m)return play(m);g.sel=-1;g.lm=[]}refresh()}
+function play(m){const s=g.s,t=s.t;g.ply=(g.ply||0)+1;(g.hist=g.hist||[]).push(m.f*64+m.t);if(g.online&&t===pc&&ON.gr)ON.gr.child('h').set({id:ON.gid,h:g.hist});if(t===pc)setTimeout(()=>rate(s,m,g.ply),40);let mv=pcs[m.f],cs=m.t;if(m.ep)cs=m.t-8*t;const cap=pcs[cs];if(cap){cap.userData.die=1;pcs[cs]=null}
+ if(m.pr){const q=mk(5,t);q.position.copy(mv.position);bg.remove(mv);bg.add(q);mv=q}
+ pcs[m.f]=null;pcs[m.t]=mv;mv.userData.tg=sqPos(m.t);
+ if(m.cs){const rf=m.cs>0?m.f+3:m.f-4,rt=m.cs>0?m.f+1:m.f-1,rk=pcs[rf];pcs[rt]=rk;pcs[rf]=null;rk.userData.tg=sqPos(rt)}
+ if(g.started&&g.timed)tm[t]+=g.inc;g.started=1;g.s=app(s,m);g.last=[m.f,m.t];g.sel=-1;g.lm=[];
+ const n=legal(g.s);if(!n.length){g.over=1;if(inChk(g.s)){g.winner=t;g.msg='Checkmate! '+(t===pc?'You win!':BN[g.bot]+' wins')}else g.msg='Stalemate — draw'}else msgUpd();
+ refresh();if(!g.over&&g.s.t!==pc)botMove()}
+/* ---------- 4-player game flow ---------- */
+let pcs4=[];const tm4=[0,0,0,0],DIR4=[[0,1],[-1,0],[0,-1],[1,0]],LIM4=320;
+function mk4(p){const o=p>>3,m=mk(p&7,1,o>3?DEAD:C4[o]);m.scale.setScalar(S4/S);m.rotation.y=[0,-Math.PI/2,Math.PI,Math.PI/2][o]||0;return m}
+function place4(){pcs4.forEach(p=>p&&bg4.remove(p));bg4.children.filter(o=>o.userData.t).forEach(o=>bg4.remove(o));pcs4=new Array(196).fill(null);
+ for(let i=0;i<196;i++){const v=g.s.b[i];if(v>0){const m=mk4(v);m.position.copy(sqPos4(i));bg4.add(m);pcs4[i]=m}}}
+function newGame4(){const my=cfg.side?2:0;bg.visible=false;bg4.visible=true;bg4.rotation.y=my?Math.PI:0;
+ ((g&&g.av)||[]).forEach(a=>scene.remove(a));if(bot)scene.remove(bot);
+ g={n4:1,s:init4(),me:my,over:0,started:0,sel:-1,lm:[],last:null,winner:-1,busy:0,bot:cfg.bot,timed:!!TM[cfg.time],inc:IN[cfg.inc]*1000,msg:'',ev:'',ply:0,av:[]};
+ tm4.fill(TM[cfg.time]*60000);place4();
+ let k=0;const th=bg4.rotation.y;for(let o=0;o<4;o++)if(o!==my){const a=fig(C4[o],1+k++%3),dx=DIR4[o][0],dz=DIR4[o][1];
+  a.position.set((dx*Math.cos(th)+dz*Math.sin(th))*.52,H-.03,BZ+(-dx*Math.sin(th)+dz*Math.cos(th))*.4);a.scale.setScalar(1.5);a.lookAt(0,H-.03,BZ);a.userData.seat=o;scene.add(a);g.av.push(a)}
+ clk.position.set(-.85,H+.22,BZ+.05);clk.lookAt(0,H+.22,0);
+ badge.visible=false;refresh4();msgUpd4();drive4()}
+function msgUpd4(){if(g.over)return;const s=g.s,t=s.t,chk=s.kp[t]>=0&&atk4(s,s.kp[t],t);g.msg=(chk?'Check! ':'')+(t===g.me?'Your move':P4N[t]+' is thinking…');lastKey=''}
+function refresh4(){hl4.forEach(d=>{if(d)d.visible=false});const s=g.s,on=(i,c,o)=>{const d=hl4[i];d.visible=true;d.material.color.setHex(c);d.material.opacity=o};
+ if(g.last)g.last.forEach(i=>on(i,0xffdd55,.35));
+ for(let o=0;o<4;o++)if(s.al[o]&&s.kp[o]>=0&&atk4(s,s.kp[o],o))on(s.kp[o],0xff3344,.6);
+ g.lm.forEach(m=>on(m.t,0x66ff88,.6));if(g.sel>=0)on(g.sel,0x44aaff,.65)}
+function clickSq4(sq){if(g.over||g.busy||g.s.t!==g.me)return;const s=g.s,p=s.b[sq];
+ if(p>0&&(p>>3)===g.me){g.sel=sq;g.lm=legal4(s,g.me).filter(m=>m.f===sq)}
+ else{const m=g.sel>=0&&g.lm.find(m=>m.t===sq);if(m)return play4(m);g.sel=-1;g.lm=[]}refresh4()}
+/* eliminated players' pieces turn grey: still on the board and capturable, but they no longer move or attack */
+function elim4(o,why){const s=g.s;s.al[o]=0;s.kp[o]=-1;
+ for(let i=0;i<196;i++){const p=s.b[i];if(p>0&&(p>>3)===o){s.b[i]=32+(p&7);const m=pcs4[i];if(m)m.traverse(x=>{if(x.material)x.material.color.setHex(DEAD)})}}
+ g.ev=P4N[o]+(o===g.me?' (you)':'')+' '+why+'!'}
+function play4(m){const s=g.s,o=s.t,q=s.b[m.t];g.ev='';g.ply++;
+ let mv=pcs4[m.f];const cap=pcs4[m.t];if(cap){cap.userData.die=1;pcs4[m.t]=null}
+ if(m.pr){const n=mk4(o*8+m.pr);n.position.copy(mv.position);bg4.remove(mv);bg4.add(n);mv=n}
+ pcs4[m.f]=null;pcs4[m.t]=mv;mv.userData.tg=sqPos4(m.t);
+ if(g.started&&g.timed)tm4[o]+=g.inc;g.started=1;
+ do4(s,m);if(q>0&&(q&7)===6&&(q>>3)<4)elim4(q>>3,'was captured');
+ s.t=nxs(s,o);g.last=[m.f,m.t];g.sel=-1;g.lm=[];
+ resolve4();refresh4();drive4()}
+/* after every move: eliminate players who have no legal move (checkmate / stalemate), then check for the end of the game */
+function resolve4(){const s=g.s;
+ for(;;){const alive=s.al.filter(Boolean).length;
+  if(alive<2){g.over=1;g.winner=s.al.indexOf(1);g.msg=g.winner<0?'Draw':g.winner===g.me?'You win!':P4N[g.winner]+' wins!';break}
+  if(s.b.every(p=>p<=0||(p>>3)>3||(p&7)===6)){g.over=1;g.winner=-1;g.msg='Draw — only kings left';break}
+  if(g.ply>=LIM4){const m=[0,0,0,0];for(let i=0;i<196;i++){const p=s.b[i];if(p>0&&(p>>3)<4&&(p&7)<6)m[p>>3]+=V4[p&7]}
+   let w=-1,bv=-1,tie=0;m.forEach((v,o)=>{if(!s.al[o])return;if(v>bv){bv=v;w=o;tie=0}else if(v===bv)tie=1});
+   g.over=1;g.winner=tie?-1:w;g.msg=tie?'Move limit — draw':'Move limit — '+(w===g.me?'you lead':P4N[w]+' leads')+' on material';break}
+  const t=s.t;if(legal4(s,t).length)break;
+  elim4(t,atk4(s,s.kp[t],t)?'checkmated':'stalemated');s.t=nxs(s,t)}
+ if(!g.over)msgUpd4();lastKey=''}
+function drive4(){if(g.over||g.busy||g.s.t===g.me)return;botMove4()}
+function botMove4(){const G=g,seat=g.s.t;g.busy=1;
+ setTimeout(()=>{if(g!==G)return;g.busy=0;if(g.over)return;if(g.s.t!==seat||!g.s.al[seat])return drive4();
+  const m=best4(g.s,seat,g.bot);if(m)play4(m);else{resolve4();refresh4();drive4()}},g.s.al[g.me]?600:250)}
+function drawClock4(){const s=g.s,timed=g.timed,key=[g.msg,g.ev,s.t,g.over,s.al.join(''),timed&&tm4.map(fmt).join(',')].join('|');if(key===lastKey)return;lastKey=key;
+ const x=clk.userData.x;x.clearRect(0,0,512,256);x.fillStyle='rgba(14,18,40,.92)';rr(x,0,0,512,256,22);x.fill();
+ for(let o=0;o<4;o++){const y=8+o*46,on=!g.over&&s.t===o,out=!s.al[o];
+  x.fillStyle=on?'#2a4fd0':'#1b2250';rr(x,14,y,484,42,12);x.fill();x.globalAlpha=out?.4:1;
+  x.fillStyle='#'+C4[o].toString(16).padStart(6,'0');x.beginPath();x.arc(42,y+21,12,0,7);x.fill();
+  x.fillStyle='#fff';x.textAlign='left';x.font='22px sans-serif';x.fillText(o===g.me?'You ('+P4N[o]+')':P4N[o]+' (bot)',66,y+29);
+  x.textAlign='right';x.font='bold 30px monospace';x.fillText(out?'OUT':timed?fmt(tm4[o]):'∞',484,y+31);x.globalAlpha=1}
+ x.textAlign='center';x.font='22px sans-serif';x.fillStyle='#ffd24a';x.fillText(g.msg,256,218);
+ x.font=g.ev?'bold 20px sans-serif':'16px sans-serif';x.fillStyle=g.ev?'#ff9f6b':'#8893c8';x.fillText(g.ev||'Y / X on left controller = menu',256,244);clk.userData.t.needsUpdate=true}
+function anim4(T){const s=g.s,cur=s.t,over=g.over,w=g.winner;
+ g.av.forEach(a=>{const u=a.userData,o=u.seat,th=!over&&cur===o,win=over&&w===o;
+  a.position.y=H-.03+(th?Math.abs(Math.sin(T*8))*.012:0);u.hd.rotation.y=th?Math.sin(T*3)*.4:Math.sin(T*.7+o)*.1;u.hd.rotation.x=(!s.al[o]||(over&&w>=0&&!win))?.6:0;
+  u.aR.rotation.z=win?2.6+Math.sin(T*10)*.3:.15;u.aL.rotation.z=win?-2.6-Math.sin(T*10)*.3:-.15});
+ const u=me.userData,mine=!over&&cur===g.me,win=over&&w===g.me;
+ me.position.y=H-.03+(mine?Math.abs(Math.sin(T*5))*.006:0);u.hd.rotation.y=Math.sin(T*.8)*.1;u.hd.rotation.x=(!s.al[g.me]||(over&&w>=0&&!win))?.6:0;
+ u.aR.rotation.z=win?2.6+Math.sin(T*10)*.3:.15;u.aL.rotation.z=win?-2.6-Math.sin(T*10)*.3:-.15}
+
+/* move ratings (approximate, from a 3-ply search of every legal move) */
+const QL={brilliant:['Brilliant','!!','#26c9c3'],great:['Great','!','#5b8baf'],best:['Best','★','#96bc4b'],excellent:['Excellent','👍','#96bc4b'],good:['Good','✓','#95b776'],book:['Book','📖','#a88865'],inacc:['Inaccuracy','?!','#f7c631'],mistake:['Mistake','?','#e58f2a'],miss:['Miss','✗','#ff7769'],blunder:['Blunder','??','#ca3431']};
+const bc=document.createElement('canvas');bc.width=bc.height=128;const bt=new THREE.CanvasTexture(bc),badge=new THREE.Sprite(new THREE.SpriteMaterial({map:bt,transparent:true,depthTest:false}));badge.scale.set(.06,.06,1);badge.renderOrder=9;badge.visible=false;bg.add(badge);let badgeT=0;
+/* chess.com-style review: win-probability (expected points) lost vs the engine's best move, quiescence search, opening book, sacrifice + miss detection */
+const EPc=c=>Math.abs(c)>9e4?Math.sign(c)*5000:c,EP=c=>1/(1+Math.exp(-EPc(c)/270)),sn=i=>String.fromCharCode(97+(i&7))+((i>>3)+1);
+const BOOK=('e2e4 e7e5 g1f3 b8c6 f1b5 a7a6 b5a4 g8f6 e1g1 f8e7|e2e4 e7e5 g1f3 b8c6 f1c4 f8c5 c2c3 g8f6 d2d4 e5d4|e2e4 e7e5 g1f3 g8f6 f3e5 d7d6 e5f3 f6e4 d2d4 d6d5|e2e4 c7c5 g1f3 d7d6 d2d4 c5d4 f3d4 g8f6 b1c3 a7a6|e2e4 c7c5 g1f3 b8c6 d2d4 c5d4 f3d4 g8f6 b1c3 e7e5|e2e4 e7e6 d2d4 d7d5 b1c3 g8f6 c1g5 f8e7 e4e5 f6d7|e2e4 c7c6 d2d4 d7d5 b1c3 d5e4 c3e4 c8f5 e4g3 f5g6|e2e4 d7d5 e4d5 d8d5 b1c3 d5a5 d2d4 g8f6|d2d4 d7d5 c2c4 e7e6 b1c3 g8f6 c1g5 f8e7 e2e3 e8g8|d2d4 d7d5 c2c4 c7c6 g1f3 g8f6 b1c3 d5c4 a2a4 c8f5|d2d4 g8f6 c2c4 g7g6 b1c3 f8g7 e2e4 d7d6 g1f3 e8g8|d2d4 g8f6 c2c4 e7e6 b1c3 f8b4 e2e3 e8g8 f1d3 d7d5|d2d4 d7d5 g1f3 g8f6 c1f4 e7e6 e2e3 c7c5 c2c3 b8c6|c2c4 e7e5 b1c3 g8f6 g1f3 b8c6 g2g3 d7d5 c4d5 f6d5|g1f3 d7d5 c2c4 e7e6 g2g3 g8f6 f1g2 f8e7 e1g1 e8g8').split('|');
+const mat=s=>{let x=0;for(let i=0;i<64;i++){const p=s.b[i];if(p)x+=Math.sign(p)*V[Math.abs(p)]}return x*s.t};
+const caps=s=>gen(s).filter(m=>(s.b[m.t]||m.ep||m.pr)&&(n=>!atk(n.b,n.b.indexOf(6*s.t),-s.t))(app(s,m))).sort((x,y)=>sc(s,y)-sc(s,x));
+function qs(s,a,b,d,f){const e=f(s);if(d<=0||e>=b)return e;if(e>a)a=e;for(const m of caps(s)){const v=-qs(app(s,m),-b,-a,d-1,f);if(v>=b)return v;if(v>a)a=v}return a}
+function rn(s,d,a,b){if(d===0)return qs(s,a,b,4,ev);const ms=legal(s);if(!ms.length)return inChk(s)?-99999-d:0;ms.sort((x,y)=>sc(s,y)-sc(s,x));for(const m of ms){const v=-rn(app(s,m),d-1,-b,-a);if(v>a){a=v;if(a>=b)break}}return a}
+function rate(pre,m,ply){const G=g,ms=legal(pre).sort((x,y)=>sc(pre,y)-sc(pre,x)),vs=[];let i=0,pv=0;
+ const step=()=>{if(g!==G)return;const t1=Date.now();while(i<ms.length&&Date.now()-t1<14){const x=ms[i++],v=-rn(app(pre,x),2,-1e9,1e9);vs.push(v);if(x.f===m.f&&x.t===m.t&&x.pr===m.pr)pv=v}if(i<ms.length)setTimeout(step,0);else fin()};
+ const fin=()=>{if(g!==G)return;const so=[...vs].sort((a,b)=>b-a),bv=so[0],sv=so.length>1?so[1]:bv,n=app(pre,m),mt=Math.abs(pre.b[m.f]),exp=g.exp;let L=EP(bv)-EP(pv),k;
+ if(bv>9e4&&pv<9e4)L=Math.max(L,.12);if(pv<-9e4&&bv>-9e4)L=Math.max(L,.25);
+ const sac=mt>=2&&mt<=5?mat(pre)+qs(n,-1e9,1e9,8,mat):0;
+ if(L<=.002)k=ms.length>1&&EP(bv)-EP(sv)>=.1&&EP(bv)<.95?'great':'best';
+ else if(L<=.02)k='excellent';else if(L<=.05)k='good';else if(L<=.1)k='inacc';else if(L<=.2)k='mistake';else k='blunder';
+ if(sac>=200&&L<=.02&&EP(pv)>=.4&&EP(bv)<.92)k='brilliant';
+ if(k==='inacc'||k==='mistake'){if((exp!==undefined&&EP(bv)-EP(exp)>=.1)||(bv>9e4&&pv<9e4))k='miss'}
+ const h=(g.hist||[]).map(v=>sn(v>>6)+sn(v&63)).join(' ');if(BOOK.some(l=>l.startsWith(h)))k='book';
+ const q=QL[k],x=bc.getContext('2d');x.clearRect(0,0,128,128);x.fillStyle=q[2];x.beginPath();x.arc(64,64,58,0,7);x.fill();x.fillStyle='#fff';x.font='bold 64px sans-serif';x.textAlign='center';x.fillText(q[1],64,86);bt.needsUpdate=true;
+ const p=sqPos(m.t);badge.position.set(p.x+S*.35,.11,p.z-S*.35);badge.visible=true;badgeT=4;g.exp=pv;g.rq=q;lastKey=''};setTimeout(step,0)}
+function botMove(){if(ON.peer)return;g.busy=1;setTimeout(()=>{if(g.over){g.busy=0;return}const m=best(g.s,DEP[g.bot],NOI[g.bot]);g.busy=0;if(m)play(m)},600)}
+
+/* ---------- input ---------- */
+const rc=new THREE.Raycaster(),tmx=new THREE.Matrix4();
+function rayOf(c){tmx.identity().extractRotation(c.matrixWorld);rc.ray.origin.setFromMatrixPosition(c.matrixWorld);rc.ray.direction.set(0,0,-1).applyMatrix4(tmx);return rc}
+function aim(r){if(menu.visible){const h=r.intersectObject(menu)[0];if(!h)return{k:null,d:3};const px=h.uv.x*512,py=(1-h.uv.y)*680,q=(page>=2?hr3():page?hr2():HR).find(q=>px>=q.x&&px<=q.x+q.w&&py>=q.y&&py<=q.y+q.h);return{k:'m',id:q&&q.id,d:h.distance}}
+ const h=r.intersectObjects(g&&g.n4?hits4:hits)[0];return h?{k:'s',sq:h.object.userData.sq,d:h.distance}:{k:null,d:3}}
+const click=a=>{if(a.k==='m'){if(a.id)act(a.id)}else if(a.k==='s')(g.n4?clickSq4:clickSq)(a.sq)};
+/* trigger grab: hold the trigger on one of your pieces to pick it up (it follows the laser), release over a legal square to place it */
+let held=null;
+const mine=sq=>g.n4?g.s.t===g.me&&g.s.b[sq]>0&&(g.s.b[sq]>>3)===g.me:g.s.t===pc&&g.s.b[sq]*pc>0;
+function grab(c,a){const n4=g.n4,P=(n4?pcs4:pcs)[a.sq];(n4?clickSq4:clickSq)(a.sq);if(P&&g.sel===a.sq){delete P.userData.tg;held={c,from:a.sq,m:P,g,d:a.d}}}
+function drop(a){const h=held;held=null;if(h.g!==g)return;const n4=g.n4,m=!g.over&&g.sel===h.from&&a.k==='s'&&g.lm.find(x=>x.t===a.sq);
+ if(m)return(n4?play4:play)(m);
+ h.m.userData.tg=(n4?sqPos4:sqPos)(h.from);
+ if(!(a.k==='s'&&a.sq===h.from)){g.sel=-1;g.lm=[];(n4?refresh4:refresh)()}}
+const ctrls=[0,1].map(i=>{const c=renderer.xr.getController(i);
+ const ln=new THREE.Line(new THREE.BufferGeometry().setFromPoints([new V3(),new V3(0,0,-1)]),new THREE.LineBasicMaterial({color:0x6ea8ff}));ln.scale.z=3;c.add(ln);c.userData.ln=ln;
+ const bd=add(c,new THREE.CylinderGeometry(.015,.02,.1,10),M(0x888899));bd.rotation.x=Math.PI/2;
+ c.addEventListener('selectstart',()=>{if(held)drop({});const a=aim(rayOf(c));if(a.k==='s'&&!g.over&&!g.busy&&mine(a.sq))grab(c,a);else click(a)});
+ c.addEventListener('selectend',()=>{if(held&&held.c===c)drop(aim(rayOf(c)))});scene.add(c);return c});
+let mouse=null,prevBtn=false;
+addEventListener('pointermove',e=>{mouse=new THREE.Vector2(e.clientX/innerWidth*2-1,-(e.clientY/innerHeight)*2+1)});
+renderer.domElement.addEventListener('pointerdown',e=>{if(renderer.xr.isPresenting)return;mouse=new THREE.Vector2(e.clientX/innerWidth*2-1,-(e.clientY/innerHeight)*2+1);rc.setFromCamera(mouse,camera);click(aim(rc))});
+addEventListener('keydown',e=>{if(e.key==='m'||e.key==='M')toggleMenu()});
+addEventListener('resize',()=>{camera.aspect=innerWidth/innerHeight;camera.updateProjectionMatrix();renderer.setSize(innerWidth,innerHeight)});
+const vr=document.getElementById('vr'),ui=document.getElementById('ui');
+if(navigator.xr)navigator.xr.isSessionSupported('immersive-vr').then(ok=>{vr.textContent=ok?'Enter VR':'Try Enter VR (not reported as supported)';vr.disabled=false}).catch(e=>{console.warn('WebXR check failed',e);vr.textContent='Try Enter VR (check failed: '+((e&&e.name)||'error')+')';vr.disabled=false});else vr.textContent='WebXR not available — needs https:// in a VR browser (desktop mode works)';
+vr.onclick=()=>{if(!navigator.xr){vr.textContent='No WebXR here — open this page over https:// in your headset browser';return}navigator.xr.requestSession('immersive-vr',{optionalFeatures:['local-floor','bounded-floor']}).then(s=>{renderer.xr.setReferenceSpaceType('local-floor');renderer.xr.setSession(s);ui.style.display='none';s.addEventListener('end',()=>ui.style.display='')}).catch(e=>{vr.textContent='VR failed: '+((e&&e.name)||'error')+' — '+((e&&e.message)||'').slice(0,80)})};
+
+/* ---------- online via Firebase Realtime Database (anonymous auth). games/CODE = {host,guest,busy,start,h}; both players run the engine and trade the move list ---------- */
+let lobby=null,db=null;const tab=Math.random().toString(36).slice(2),drawIf=()=>{if(menu.visible)drawMenu()};
+const ONL={list:[],games:()=>ONL.list};
+let fbMsg=typeof firebase==='undefined'?'Firebase scripts did not load (offline or blocked)':FIREBASE_CONFIG.apiKey==='PASTE'?'Add your Firebase config (top of the file)':'Connecting to Firebase…';
+try{if(typeof firebase!=='undefined'&&FIREBASE_CONFIG.apiKey!=='PASTE'){firebase.initializeApp(FIREBASE_CONFIG);db=firebase.database();
+ firebase.auth().signInAnonymously().then(()=>{lobby=true;fbMsg='';
+  db.ref('games').orderByChild('busy').equalTo(0).limitToLast(8).on('value',s=>{ONL.list=[];s.forEach(c=>{if(c.val().host!==tab)ONL.list.push(c.key)});drawIf()},er=>{fbMsg='Database error: '+(er.code||er.message)+' (check your rules)';drawIf()})}).catch(e=>{fbMsg='Sign-in failed: '+(e.code||e.message)+' (enable Anonymous sign-in; add this site to Authorized domains)';drawIf()})}}catch(e){fbMsg='Setup error: '+(e.message||e);console.warn(e)}
+const refG=c=>db.ref('games/'+c),genCode=()=>Array.from({length:4},()=>'ABCDEFGHJKMNPQRSTUVWXYZ23456789'[Math.random()*31|0]).join('');
+function listen(r,fn){r.on('value',fn);ON.un.push(()=>r.off('value',fn))}
+function listenMoves(r){listen(r.child('h'),s=>{const d=s.val();if(!d||!g.online||d.id!==ON.gid||!Array.isArray(d.h))return;for(let i=(g.hist||[]).length;i<d.h.length;i++){const v=d.h[i],mv=g.over?null:legal(g.s).find(x=>x.f===(v>>6)&&x.t===(v&63));if(!mv)break;play(mv)}})}
+async function createGame(){if(!lobby||ON.role)return;fbMsg='';const c=genCode(),r=refG(c);try{await r.set({host:tab,busy:0,t:firebase.database.ServerValue.TIMESTAMP})}catch(e){fbMsg='Create failed: '+(e.code||e.message)+' (check your rules)';return drawIf()}r.onDisconnect().remove();
+ ON.gr=r;ON.role='host';ON.code=c;ON.peer=0;ON.un=[];
+ listen(r.child('guest'),s=>{const v=s.val();if(v&&!ON.peer){ON.peer=1;r.child('busy').set(1);startOnline();drawIf()}
+  else if(!v&&ON.peer){ON.peer=0;r.child('busy').set(0);if(g.online&&!g.over){g.over=1;g.winner=pc;g.msg='Opponent left \u2014 you win'}g.online=0;lastKey='';drawIf()}});
+ listenMoves(r);page=3;drawIf()}
+async function joinGame(c){if(!lobby||ON.role)return;const r=refG(c);
+ try{if(!(await r.child('host').get()).exists())return;const res=await r.child('guest').transaction(v=>v===null?tab:undefined);if(!res.committed)return;
+  r.child('guest').onDisconnect().remove();ON.gr=r;ON.role='guest';ON.code=c;ON.peer=0;ON.un=[];ON.gid='';
+  listen(r.child('start'),s=>{const d=s.val();if(!d||d.gid===ON.gid)return;ON.gid=d.gid;ON.peer=1;cfg.time=d.time;cfg.inc=d.inc;cfg.side=1-d.hs;beginOnline();toggleMenu(false)});
+  listen(r,s=>{if(!s.exists())leaveOnline('Host left')});listenMoves(r);page=3;drawIf()}catch(e){console.warn(e);fbMsg='Join failed: '+(e.code||e.message);leaveOnline('Could not join')}}
+function startOnline(){ON.gid=Date.now().toString(36);ON.gr.update({start:{gid:ON.gid,time:cfg.time,inc:cfg.inc,hs:cfg.side},h:null});beginOnline()}
+function beginOnline(){const b=cfg.bot;cfg.bot=3;newGame();cfg.bot=b;g.online=1;lastKey=''}
+function leaveOnline(msg){const r=ON.gr,was=ON.role;(ON.un||[]).forEach(f=>f());ON.un=[];ON.gr=null;ON.role=null;ON.peer=0;ON.gid='';
+ if(r){try{if(was==='host'){r.onDisconnect().cancel();r.remove()}else{r.child('guest').onDisconnect().cancel();r.child('guest').remove()}}catch(e){}}
+ if(g&&g.online){if(!g.over){g.over=1;g.winner=was==='host'?pc:0;g.msg=msg}g.online=0;lastKey=''}page=0;drawIf()}
+/* screen-mode online panel (desktop testing: create / join / leave without the 3D menu) */
+const dbg=document.getElementById('dbg');
+function dbgDraw(){const L=ONL.games();let h;
+ if(!lobby)h='<i>'+fbMsg+'</i>';
+ else if(ON.role)h='<b>'+(ON.role==='host'?'Hosting ':'Joined ')+ON.code+'</b> — '+(ON.peer?'opponent connected':'waiting…')+'<br>'+(ON.role==='host'?'<button data-a="new">New Game</button><button data-a="close">Close Server</button>':'<button data-a="leave">Leave</button>');
+ else h='<button data-a="create">Create Game</button><br>'+(L.length?L.map(c=>'<button data-a="j:'+c+'">Join '+c+'</button>').join(''):'<i>No open games</i>');
+ if(lobby&&fbMsg)h+='<br><i>'+fbMsg+'</i>';if(dbg.dataset.h!==h){dbg.dataset.h=h;dbg.innerHTML=h}}
+dbg.onclick=e=>{const a=e.target.dataset&&e.target.dataset.a;if(!a)return;if(a==='create')createGame();else if(a==='new')act('new');else if(a==='close'||a==='leave')leaveOnline(a==='close'?'Server closed':'You left the game');else if(a.startsWith('j:'))joinGame(a.slice(2))};
+dbgDraw();setInterval(dbgDraw,500);
+/* ---------- loop ---------- */
+const clock=new THREE.Clock();setTheme(0);setEnv(0);newGame();
+renderer.setAnimationLoop(()=>{const dt=Math.min(clock.getDelta(),.1),T=clock.elapsedTime,ss=renderer.xr.getSession();
+ if(ss){let d=false;for(const src of ss.inputSources)if(src.handedness==='left'&&src.gamepad){const b=src.gamepad.buttons;d=d||!!(b[4]&&b[4].pressed)||!!(b[5]&&b[5].pressed)}
+  if(d&&!prevBtn)toggleMenu();prevBtn=d}
+ let hs=-1,hm=null;
+ if(ss)ctrls.forEach(c=>{const a=aim(rayOf(c));c.userData.ln.scale.z=a.d;if(held&&held.c===c&&held.g===g){if(a.k==='s')held.d=a.d;const q=rc.ray,l=(g.n4?bg4:bg).worldToLocal(q.origin.clone().addScaledVector(q.direction,held.d));held.m.position.set(l.x,Math.max(.03,Math.min(.16,l.y)),l.z)}if(a.k==='s')hs=a.sq;if(a.k==='m')hm=a.id||null});
+ else if(mouse){rc.setFromCamera(mouse,camera);const a=aim(rc);if(a.k==='s')hs=a.sq;if(a.k==='m')hm=a.id||null}
+ if(hm!==mhov){mhov=hm;if(menu.visible)drawMenu()}
+ if(g.n4){hov.visible=false;hov4.visible=hs>=0&&!g.over&&g.s.t===g.me&&!menu.visible;if(hov4.visible){const hp=sqPos4(hs);hov4.position.set(hp.x,.004,hp.z)}}
+ else{hov4.visible=false;hov.visible=hs>=0&&!g.over&&g.s.t===pc&&!menu.visible;if(hov.visible)hov.position.set(sqPos(hs).x,.004,sqPos(hs).z)};
+ if(!g.over&&g.started&&g.timed){if(g.n4){const tt=g.s.t;tm4[tt]-=dt*1000;if(tm4[tt]<=0){tm4[tt]=0;elim4(tt,'ran out of time');g.s.t=nxs(g.s,tt);resolve4();refresh4();drive4()}}
+  else{tm[g.s.t]-=dt*1000;if(tm[g.s.t]<=0){tm[g.s.t]=0;g.over=1;g.winner=-g.s.t;g.msg='Time out! '+(g.winner===pc?'You win!':BN[g.bot]+' wins')}}}
+ for(const grp of[bg,bg4])for(const o of grp.children.slice()){const u=o.userData;if(u.die){o.scale.multiplyScalar(.85);if(o.scale.x<.05)grp.remove(o)}
+  else if(u.tg){const dx=u.tg.x-o.position.x,dz=u.tg.z-o.position.z,dd=Math.hypot(dx,dz);o.position.x+=dx*.18;o.position.z+=dz*.18;o.position.y=Math.min(.06,dd*.8)}}
+ /* avatar animation */
+ if(g.n4)anim4(T);else{const think=!g.over&&g.s.t!==pc,mine=!g.over&&g.s.t===pc;
+ bot.position.y=H-.03+(think?Math.abs(Math.sin(T*8))*.012:0);bot.userData.hd.rotation.y=think?Math.sin(T*3)*.4:Math.sin(T*.7)*.1;bot.userData.hd.rotation.x=0;
+ me.position.y=H-.03+(mine?Math.abs(Math.sin(T*5))*.006:0);me.userData.hd.rotation.y=Math.sin(T*.8)*.1;
+ for(const[a,win]of[[me,g.winner===pc&&g.over&&g.winner],[bot,g.winner===-pc&&g.over&&g.winner]]){const u=a.userData;
+  if(win){u.aR.rotation.z=2.6+Math.sin(T*10)*.3;u.aL.rotation.z=-2.6-Math.sin(T*10)*.3}else{u.aR.rotation.z=.15;u.aL.rotation.z=-.15;if(g.over&&g.winner&&a===(g.winner===pc?bot:me))u.hd.rotation.x=.6}}}
+ if(badge.visible){badgeT-=dt;badge.position.y=.11+Math.sin(T*6)*.004;if(badgeT<=0)badge.visible=false}
+ drawClock();renderer.render(scene,camera)});
+</script></body></html>
